@@ -10,109 +10,231 @@ import (
 	"github.com/LeeFred3042U/kitcat/internal/storage"
 )
 
-func AddFile(path string) error {
-	path = filepath.Clean(path)
-	if !IsSafePath(path) {
-		return fmt.Errorf("unsafe path detected: %s", path)
-	}
-	// Guard: ensure we're inside a kitcat repo
+// AddFile stages a file or directory.
+// If inputPath is a directory, it recursively stages all files inside.
+// Expects a repo-relative path (or a path that passes IsSafePath).
+// Stores metadata (mtime, size) so future `AddAll` can avoid re-hashing unchanged files.
+//
+// Behaviour and invariants:
+//   - Accepts an input path (file or directory). The function resolves absolute
+//     paths and *stores only repo-relative paths* in the index. This prevents
+//     split-brain (absolute vs relative) and ensures tree-hash determinism.
+//   - The index update happens inside a single UpdateIndexWithMeta transaction
+//     to avoid races and to keep metadata consistent.
+//   - Uses size+modtime as a fast-path to avoid re-hashing unchanged files.
+//   - Honors ignore rules and repository safety checks (IsSafePath).
+func AddFile(inputPath string) error {
+	// Step 1: Ensure we are inside a kitcat repository.
 	if _, err := os.Stat(RepoDir); os.IsNotExist(err) {
 		return errors.New("not a kitcat repository (run `kitcat init`)")
 	}
 
-	hash, err := storage.HashAndStoreFile(path)
+	// Step 2: Resolve the absolute path of the input.
+	absInputPath, err := filepath.Abs(inputPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to resolve absolute path: %w", err)
 	}
 
-	// Use UpdateIndex to safely update the index transactionally
-	return storage.UpdateIndex(func(index map[string]string) error {
-		// Skip if already tracked with same hash
-		if existing, ok := index[path]; ok && existing == hash {
-			return nil
-		}
+	// Step 3: Resolve the absolute path of the repo root.
+	absRepoRoot, err := filepath.Abs(".")
+	if err != nil {
+		return fmt.Errorf("failed to resolve repo root: %w", err)
+	}
 
-		index[path] = hash
-		return nil
-	})
-}
+	// Check if the file exists
+	if _, err := os.Stat(absInputPath); os.IsNotExist(err) {
+		return fmt.Errorf("path does not exist: %s", inputPath)
+	}
 
-// AddAll stages all changes in the working directory.
-// This includes new files, modified files, and deleted files.
-func AddAll() error {
-	// Use UpdateIndex to safely update the index transactionally.
-	// We hold the lock during the entire walk to ensure consistency.
-	return storage.UpdateIndex(func(index map[string]string) error {
-		// Load ignore patterns
+	// Step 4: Open the Index Transaction ONCE.
+	// We do the walking and hashing inside the lock to ensure consistency.
+	return storage.UpdateIndexWithMeta(func(index map[string]storage.IndexEntry) error {
 		ignorePatterns, err := LoadIgnorePatterns()
 		if err != nil {
 			return err
 		}
 
-		// We need a way to track which files we see in the working directory
-		// A map is used for this, giving us O(1) average time complexity for lookups
-		filesInWorkDir := make(map[string]bool)
+		// Build a simple proxy for legacy ShouldIgnore behaviour.
+		proxyIndex := make(map[string]string, len(index))
+		for k, v := range index {
+			proxyIndex[k] = v.Hash
+		}
 
-		// Walk the entire directory tree, starting from the current location "."
-		err = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+		// Step 5: Walk the target (File or Directory).
+		// filepath.Walk works for both. If absInputPath is a file, the func runs once.
+		return filepath.Walk(absInputPath, func(fullPath string, info os.FileInfo, err error) error {
 			if err != nil {
-				return err
+				return err // Permission errors, etc.
 			}
 
-			// Clean the path to use consistent separators.
-			cleanPath := filepath.Clean(path)
-
-			if !IsSafePath(cleanPath) {
-				fmt.Printf("warning: skipping unsafe path: %s\n", cleanPath)
-				return nil // Just skip unsafe paths found during a walk
+			// Step 6: Convert absolute file path → repo-relative path.
+			// This is CRITICAL for portability and tree determinism.
+			relPath, err := filepath.Rel(absRepoRoot, fullPath)
+			if err != nil {
+				return fmt.Errorf("file %s is outside repository", fullPath)
 			}
+			cleanPath := filepath.Clean(relPath)
 
-			// IMPORTANT: Skip the .kitcat directory entirely to avoid tracking our own database files.
+			// Skip the repo root itself and .kitcat directory
+			if cleanPath == "." {
+				return nil
+			}
 			if strings.HasPrefix(cleanPath, RepoDir+string(os.PathSeparator)) || cleanPath == RepoDir {
 				if info.IsDir() {
-					return filepath.SkipDir // This is an efficient way to stop descending into a directory.
+					return filepath.SkipDir
 				}
 				return nil
 			}
 
-			// We only care about files, not directories
+			// We only care about files
 			if info.IsDir() {
 				return nil
 			}
 
-			// Check if file should be ignored (but only if not already tracked)
-			if ShouldIgnore(cleanPath, ignorePatterns, index) {
-				return nil // Skip this file
+			// Step 7: Enforce repository safety rules.
+			if !IsSafePath(cleanPath) {
+				return nil // Skip unsafe paths during walk
 			}
 
-			// Mark this file as "seen" in the working directory
-			filesInWorkDir[cleanPath] = true
+			// Check ignore rules
+			if ShouldIgnore(cleanPath, ignorePatterns, proxyIndex) {
+				return nil
+			}
 
-			// Hash the file and add/update it in the index.
-			// This is the same logic as AddFile, but applied to every file we find
-			hash, err := storage.HashAndStoreFile(cleanPath)
+			// Step 8: Metadata Check (Optimization).
+			// If size & mtime match index, skip hashing.
+			if entry, exists := index[cleanPath]; exists {
+				if entry.Size == info.Size() && entry.ModTime == info.ModTime().Unix() {
+					return nil
+				}
+			}
+
+			// Step 9: Hash and store the file content.
+			// We use fullPath (absolute) to read, ensuring we find the file correctly.
+			hash, err := storage.HashAndStoreFile(fullPath)
 			if err != nil {
-				// Continue even if one file fails.
+				return fmt.Errorf("failed to hash %s: %w", fullPath, err)
+			}
+
+			// Step 10: Update the index using ONLY the repo-relative path.
+			index[cleanPath] = storage.IndexEntry{
+				Hash:    hash,
+				ModTime: info.ModTime().Unix(),
+				Size:    info.Size(),
+			}
+
+			return nil
+		})
+	})
+}
+
+// AddAll scans the working tree and updates the index:
+//   - skips files matching ignore patterns
+//   - skips files whose (size, mtime) match index metadata (fast path)
+//   - hashes and stores changed/new files
+//   - deletes index entries for files no longer present in the walk root
+//
+// Behaviour and invariants:
+//   - Walks the canonical repo root (absolute), computes repo-relative paths,
+//     and updates the index using those repo-relative keys.
+//   - Skips files matching ignore rules and paths failing IsSafePath.
+//   - Uses (size, mtime) as a fast-path to avoid re-hashing unchanged files.
+//   - Removes index entries for files that are not present under the walked root.
+func AddAll() error {
+	return storage.UpdateIndexWithMeta(func(index map[string]storage.IndexEntry) error {
+		ignorePatterns, err := LoadIgnorePatterns()
+		if err != nil {
+			return err
+		}
+
+		seen := make(map[string]bool, len(index))
+
+		// Build a simple proxy for legacy ShouldIgnore behaviour.
+		proxyIndex := make(map[string]string, len(index))
+		for k, v := range index {
+			proxyIndex[k] = v.Hash
+		}
+
+		// Walk the canonical absolute root to avoid "works on my machine" path bugs.
+		rootDir, err := filepath.Abs(".")
+		if err != nil {
+			return fmt.Errorf("failed to resolve absolute path: %w", err)
+		}
+
+		err = filepath.Walk(rootDir, func(fullPath string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err // propagate I/O errors
+			}
+
+			// Convert to repo-relative, normalized path.
+			relPath, err := filepath.Rel(rootDir, fullPath)
+			if err != nil {
+				return nil
+			}
+			cleanPath := filepath.Clean(relPath)
+			if cleanPath == "." {
+				return nil
+			}
+
+			// Safety: ensure path is safe and skip internal repo directory.
+			if !IsSafePath(cleanPath) {
+				return nil
+			}
+			if strings.HasPrefix(cleanPath, RepoDir+string(os.PathSeparator)) || cleanPath == RepoDir {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if info.IsDir() {
+				return nil
+			}
+
+			// Check ignore rules (using proxy for legacy compatibility).
+			if ShouldIgnore(cleanPath, ignorePatterns, proxyIndex) {
+				return nil
+			}
+
+			// Mark as seen for later deletion-detection.
+			seen[cleanPath] = true
+
+			// Fast path: if size & mtime match, assume unchanged.
+			if entry, exists := index[cleanPath]; exists {
+				if entry.Size == info.Size() && entry.ModTime == info.ModTime().Unix() {
+					return nil
+				}
+			}
+
+			// Slow path: hash & store file.
+			// Use fullPath (absolute) to ensure correct file reading.
+			hash, err := storage.HashAndStoreFile(fullPath)
+			if err != nil {
 				fmt.Printf("warning: could not add file %s: %v\n", cleanPath, err)
 				return nil
 			}
-			index[cleanPath] = hash
+
+			index[cleanPath] = storage.IndexEntry{
+				Hash:    hash,
+				ModTime: info.ModTime().Unix(),
+				Size:    info.Size(),
+			}
 			return nil
 		})
 		if err != nil {
 			return err
 		}
 
-		// Find and handle deleted files.
-		// We loop through the original index. If a file from the index was NOT seen
-		// during our walk of the working directory, it must have been deleted
+		// Delete index entries that were not seen during the walk.
+		var toDelete []string
 		for pathInIndex := range index {
-			if !filesInWorkDir[pathInIndex] {
-				// Remove the deleted file from our index map
-				delete(index, pathInIndex)
+			if !seen[pathInIndex] {
+				toDelete = append(toDelete, pathInIndex)
 			}
 		}
+		for _, path := range toDelete {
+			delete(index, path)
+		}
 
-		return nil // Commit changes
+		return nil
 	})
 }

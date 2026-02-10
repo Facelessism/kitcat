@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,95 +10,181 @@ import (
 
 const indexPath = ".kitcat/index"
 
-// LoadIndex reads the .kitcat/index file (in JSON format) and returns it as a map
-// It returns an empty map if the file doesn't exist, which is normal for a new repository
-func LoadIndex() (map[string]string, error) {
-	return loadIndexInternal()
+// IndexEntry holds the hash and metadata.
+// Short JSON keys keep on-disk index compact.
+type IndexEntry struct {
+	Hash    string `json:"h"`
+	ModTime int64  `json:"m,omitempty"` // Unix timestamp
+	Size    int64  `json:"s,omitempty"` // File size in bytes
 }
 
-func loadIndexInternal() (map[string]string, error) {
-	index := make(map[string]string)
+// LoadIndex returns the legacy map[path]hash view.
+// Maintains backward compatibility for code that expects the simple form.
+func LoadIndex() (map[string]string, error) {
+	rawIndex, err := LoadIndexWithMeta()
+	if err != nil {
+		return nil, err
+	}
+
+	simpleIndex := make(map[string]string, len(rawIndex))
+	for path, entry := range rawIndex {
+		simpleIndex[path] = entry.Hash
+	}
+	return simpleIndex, nil
+}
+
+// LoadIndexWithMeta reads the index file and safely detects old vs new formats.
+// Uses json.RawMessage + head-byte sniffing to avoid relying on json.Unmarshal's weak typing.
+func LoadIndexWithMeta() (map[string]IndexEntry, error) {
+	index := make(map[string]IndexEntry)
 
 	content, err := os.ReadFile(indexPath)
 	if os.IsNotExist(err) {
-		// File doesn't exist, return empty index. This is not an error ^-^
+		// No index yet — empty repository state.
 		return index, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("could not read index file: %w", err)
 	}
-
-	// If the file is empty, avoid a JSON error.
 	if len(content) == 0 {
 		return index, nil
 	}
 
-	if err := json.Unmarshal(content, &index); err != nil {
-		return nil, fmt.Errorf("could not parse index file: %w", err)
+	// Parse into a map of RawMessage so we can inspect each value exactly.
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(content, &rawMap); err != nil {
+		return nil, fmt.Errorf("index file corruption: %w", err)
+	}
+
+	for path, rawValue := range rawMap {
+		rawValue = bytes.TrimSpace(rawValue)
+		if len(rawValue) == 0 {
+			continue
+		}
+
+		switch rawValue[0] {
+		case '"':
+			// Legacy format: value is a JSON string containing the hash.
+			var hash string
+			if err := json.Unmarshal(rawValue, &hash); err != nil {
+				return nil, fmt.Errorf("failed to decode legacy entry for %s: %w", path, err)
+			}
+			// Migrate into new struct form (empty metadata means 're-check later').
+			index[path] = IndexEntry{Hash: hash}
+		case '{':
+			// New format: value is an object matching IndexEntry.
+			var entry IndexEntry
+			if err := json.Unmarshal(rawValue, &entry); err != nil {
+				return nil, fmt.Errorf("failed to decode entry for %s: %w", path, err)
+			}
+			index[path] = entry
+		default:
+			// Unknown/garbage entry — warn and skip instead of crashing repo.
+			fmt.Printf("warning: unknown index format for %s, skipping\n", path)
+		}
 	}
 
 	return index, nil
 }
 
-// UpdateIndex safely updates the index by locking it before reading.
-// The callback function 'fn' is allowed to modify the index map.
-// If 'fn' returns nil, the modified index is written to disk.
-// If 'fn' returns an error, the operation is aborted and nothing is written.
-func UpdateIndex(fn func(index map[string]string) error) error {
-	// Ensure the parent directory (.kitcat) exists.
+// UpdateIndexWithMeta is the atomic update helper.
+// It creates the .kitcat directory, obtains a file lock, loads the index,
+// invokes the callback to mutate it, then writes it back atomically.
+func UpdateIndexWithMeta(fn func(index map[string]IndexEntry) error) error {
 	if err := os.MkdirAll(filepath.Dir(indexPath), 0o755); err != nil {
 		return err
 	}
 
-	// 1. Lock the file
 	l, err := lock(indexPath)
 	if err != nil {
 		return err
 	}
 	defer unlock(l)
 
-	// 2. Load the index (without locking, since we already hold the lock)
-	index, err := loadIndexInternal()
+	index, err := LoadIndexWithMeta()
 	if err != nil {
 		return err
 	}
 
-	// 3. Callback to modify the index
 	if err := fn(index); err != nil {
-		return err // Abort transaction
-	}
-
-	// 4. Write the updated index (without locking, as we hold it)
-	return writeIndexInternal(index)
-}
-
-// WriteIndex writes the index map to the .kitcat/index file atomically using a JSON format
-// It uses SafeWriteFile to ensure atomic and durable writes
-func WriteIndex(index map[string]string) error {
-	// Ensure the parent directory (.kitcat) exists.
-	if err := os.MkdirAll(filepath.Dir(indexPath), 0o755); err != nil {
 		return err
 	}
 
-	// Lock the file to prevent concurrent writes
-	l, err := lock(indexPath)
-	if err != nil {
-		return err
-	}
-	defer unlock(l)
-
-	return writeIndexInternal(index)
-}
-
-// writeIndexInternal writes the index without acquiring a lock.
-// Caller must ensure the lock is held.
-func writeIndexInternal(index map[string]string) error {
-	// Marshal the index to JSON with indentation
 	data, err := json.MarshalIndent(index, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal index: %w", err)
 	}
 
-	// Use SafeWriteFile to atomically write the index
+	return SafeWriteFile(indexPath, data, 0644)
+}
+
+// UpdateIndex adapts legacy callers that expect map[string]string.
+// It reconciles deletions and updates back into the richer IndexEntry form.
+func UpdateIndex(fn func(index map[string]string) error) error {
+	return UpdateIndexWithMeta(func(realIndex map[string]IndexEntry) error {
+		// Build proxy simple map for legacy callback.
+		proxy := make(map[string]string, len(realIndex))
+		for path, entry := range realIndex {
+			proxy[path] = entry.Hash
+		}
+
+		if err := fn(proxy); err != nil {
+			return err
+		}
+
+		// Deletions: collect keys to delete to avoid modifying map while ranging.
+		var toDelete []string
+		for path := range realIndex {
+			if _, exists := proxy[path]; !exists {
+				toDelete = append(toDelete, path)
+			}
+		}
+		for _, path := range toDelete {
+			delete(realIndex, path)
+		}
+
+		// Updates / additions: unset metadata so the file will be re-validated later.
+		for path, newHash := range proxy {
+			existing, exists := realIndex[path]
+			if !exists || existing.Hash != newHash {
+				realIndex[path] = IndexEntry{
+					Hash:    newHash,
+					ModTime: 0,
+					Size:    0,
+				}
+			}
+		}
+		return nil
+	})
+}
+
+// WriteIndex writes a simple hash map to the index, discarding metadata.
+// This is used by operations like 'reset' or 'checkout' that reconstruct the index from a tree.
+// It sets ModTime/Size to 0, forcing 'add' to re-verify files later.
+func WriteIndex(simpleIndex map[string]string) error {
+	richIndex := make(map[string]IndexEntry, len(simpleIndex))
+	for path, hash := range simpleIndex {
+		richIndex[path] = IndexEntry{
+			Hash:    hash,
+			ModTime: 0,
+			Size:    0,
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(indexPath), 0o755); err != nil {
+		return err
+	}
+
+	l, err := lock(indexPath)
+	if err != nil {
+		return err
+	}
+	defer unlock(l)
+
+	data, err := json.MarshalIndent(richIndex, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal index: %w", err)
+	}
+
 	return SafeWriteFile(indexPath, data, 0644)
 }

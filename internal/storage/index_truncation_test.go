@@ -29,7 +29,7 @@ func TestIndexWriteSanity(t *testing.T) {
 		"README.md":     "8843d7f92416211de9ebb963ff4ce28125932878",
 	}
 
-	// Execute WriteIndex
+	// Execute WriteIndex (this now writes objects with {"h": ...})
 	if err := WriteIndex(indexData); err != nil {
 		t.Fatalf("WriteIndex failed: %v", err)
 	}
@@ -44,7 +44,8 @@ func TestIndexWriteSanity(t *testing.T) {
 	}
 
 	// Assert Valid JSON
-	var loadedMap map[string]string
+	// FIX: We must now unmarshal into IndexEntry, not string
+	var loadedMap map[string]IndexEntry
 	if err := json.Unmarshal(content, &loadedMap); err != nil {
 		t.Fatalf("Index file contains invalid JSON: %v", err)
 	}
@@ -53,7 +54,8 @@ func TestIndexWriteSanity(t *testing.T) {
 	if len(loadedMap) != 2 {
 		t.Errorf("Expected 2 entries, got %d", len(loadedMap))
 	}
-	if loadedMap["test_file.txt"] != "da39a3ee5e6b4b0d3255bfef95601890afd80709" {
+	// Check the Hash field of the struct
+	if loadedMap["test_file.txt"].Hash != "da39a3ee5e6b4b0d3255bfef95601890afd80709" {
 		t.Errorf("Index content mismatch for test_file.txt")
 	}
 }
